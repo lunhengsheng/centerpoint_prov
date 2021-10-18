@@ -13,7 +13,10 @@ class SingleStageDetector(BaseDetector):
         self,
         reader,
         backbone,
+        encoder2d = None,
         neck=None,
+        cfe = None,
+        decoder2d = None,
         bbox_head=None,
         train_cfg=None,
         test_cfg=None,
@@ -21,9 +24,24 @@ class SingleStageDetector(BaseDetector):
     ):
         super(SingleStageDetector, self).__init__()
         self.reader = builder.build_reader(reader)
-        self.backbone = builder.build_backbone(backbone)
+
+        if backbone is not None:
+            self.backbone = builder.build_backbone(backbone)
+            
         if neck is not None:
             self.neck = builder.build_neck(neck)
+
+
+        if encoder2d is not None:
+            self.encoder2d = builder.build_encoder(encoder2d)
+
+        if cfe is not None:
+            self.cfe = builder.build_cfe(cfe)
+
+        if decoder2d is not None:
+            self.decoder2d = builder.build_decoder(decoder2d)
+
+            
         self.bbox_head = builder.build_head(bbox_head)
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
@@ -56,7 +74,10 @@ class SingleStageDetector(BaseDetector):
         pass
 
     def freeze(self):
-        for p in self.parameters():
+        for name, p in self.named_parameters():
             p.requires_grad = False
+            # print("Freezing parameter")
+            # print(name)
+
         FrozenBatchNorm2d.convert_frozen_batchnorm(self)
         return self

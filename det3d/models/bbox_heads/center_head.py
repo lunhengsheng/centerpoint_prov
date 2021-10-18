@@ -20,7 +20,6 @@ try:
 except:
     print("Deformable Convolution not built!")
 
-from det3d.core.utils.circle_nms_jit import circle_nms
 
 class FeatureAdaption(nn.Module):
     """Feature Adaption Module.
@@ -233,8 +232,10 @@ class CenterHead(nn.Module):
 
         logger.info("Finish CenterHead Initialization")
 
-    def forward(self, x, *kwargs):
+    def forward(self, batch_dict, *kwargs):
         ret_dicts = []
+
+        x = batch_dict["spatial_features_2d"]
 
         x = self.shared_conv(x)
 
@@ -249,15 +250,32 @@ class CenterHead(nn.Module):
 
     def loss(self, example, preds_dicts, **kwargs):
         rets = []
+
+        #print('preds_dicts in loss: ', preds_dicts)
         for task_id, preds_dict in enumerate(preds_dicts):
             # heatmap focal loss
+            
+            
+            print("preds_dict[hm] shape in loss: ", preds_dict['hm'].shape)
+
+            #print("example[hm]: ", example['hm'])
+            print("example[hm][task_id] shape: ", example['hm'][task_id].shape)
+
+            #print("example[cat]: ", example['cat'])
+
+            #print("example[cat][task_id] shape: ", example['cat'][task_id].shape)
+
+            if(kwargs.get("fused_hm", None)) is not None:
+                preds_dict.update({'hm':kwargs["fused_hm"]})
+
             preds_dict['hm'] = self._sigmoid(preds_dict['hm'])
+
 
             hm_loss = self.crit(preds_dict['hm'], example['hm'][task_id], example['ind'][task_id], example['mask'][task_id], example['cat'][task_id])
 
             target_box = example['anno_box'][task_id]
             # reconstruct the anno_box from multiple reg heads
-            if self.dataset in ['waymo', 'nuscenes']:
+            if self.dataset in ['waymo', 'nuscenes', 'providentia', 'kitti']:
                 if 'vel' in preds_dict:
                     preds_dict['anno_box'] = torch.cat((preds_dict['reg'], preds_dict['height'], preds_dict['dim'],
                                                         preds_dict['vel'], preds_dict['rot']), dim=1)  
@@ -423,7 +441,9 @@ class CenterHead(nn.Module):
             if test_cfg.get('per_class_nms', False):
                 pass 
             else:
-                rets.append(self.post_processing(batch_box_preds, batch_hm, test_cfg, post_center_range, task_id)) 
+                #print("batch_box_preds shape: ", batch_box_preds.shape)
+
+                rets.append(self.post_processing(batch_box_preds, batch_hm, test_cfg, post_center_range, kwargs.get("pre_fusion", False))) 
 
         # Merge branches results
         ret_list = []
@@ -448,7 +468,7 @@ class CenterHead(nn.Module):
         return ret_list 
 
     @torch.no_grad()
-    def post_processing(self, batch_box_preds, batch_hm, test_cfg, post_center_range, task_id):
+    def post_processing(self, batch_box_preds, batch_hm, test_cfg, post_center_range, pre_fusion=False):
         batch_size = len(batch_hm)
 
         prediction_dicts = []
@@ -456,51 +476,62 @@ class CenterHead(nn.Module):
             box_preds = batch_box_preds[i]
             hm_preds = batch_hm[i]
 
+            print("hm_preds shape: ", hm_preds.shape)
+
             scores, labels = torch.max(hm_preds, dim=-1)
 
-            score_mask = scores > test_cfg.score_threshold
-            distance_mask = (box_preds[..., :3] >= post_center_range[:3]).all(1) \
-                & (box_preds[..., :3] <= post_center_range[3:]).all(1)
 
-            mask = distance_mask & score_mask 
+            print('scores shape before mask: ', scores.shape)
 
-            box_preds = box_preds[mask]
-            scores = scores[mask]
-            labels = labels[mask]
 
-            boxes_for_nms = box_preds[:, [0, 1, 2, 3, 4, 5, -1]]
+            if pre_fusion:
 
-            if test_cfg.get('circular_nms', False):
-                centers = boxes_for_nms[:, [0, 1]] 
-                boxes = torch.cat([centers, scores.view(-1, 1)], dim=1)
-                selected = _circle_nms(boxes, min_radius=test_cfg.min_radius[task_id], post_max_size=test_cfg.nms.nms_post_max_size)  
-            else:
+
+                print("scores shape in pre_fusion: ", scores.shape)
+
+
+
+                prediction_dict = {
+                    'box3d_lidar': box_preds,
+                    'scores': hm_preds,
+                    #'label_preds': labels
+                }
+
+
+                prediction_dicts.append(prediction_dict)
+
+            else:   
+
+                score_mask = scores > test_cfg.score_threshold
+                distance_mask = (box_preds[..., :3] >= post_center_range[:3]).all(1) \
+                    & (box_preds[..., :3] <= post_center_range[3:]).all(1)
+         
+                mask = distance_mask & score_mask 
+
+                box_preds = box_preds[mask]
+                scores = scores[mask]
+                labels = labels[mask]
+
+                print('scores shape after mask: ', scores.shape)
+
+
+                boxes_for_nms = box_preds[:, [0, 1, 2, 3, 4, 5, -1]]
+
                 selected = box_torch_ops.rotate_nms_pcdet(boxes_for_nms.float(), scores.float(), 
                                     thresh=test_cfg.nms.nms_iou_threshold,
                                     pre_maxsize=test_cfg.nms.nms_pre_max_size,
                                     post_max_size=test_cfg.nms.nms_post_max_size)
 
-            selected_boxes = box_preds[selected]
-            selected_scores = scores[selected]
-            selected_labels = labels[selected]
+                selected_boxes = box_preds[selected]
+                selected_scores = scores[selected]
+                selected_labels = labels[selected]
 
-            prediction_dict = {
-                'box3d_lidar': selected_boxes,
-                'scores': selected_scores,
-                'label_preds': selected_labels
-            }
+                prediction_dict = {
+                    'box3d_lidar': selected_boxes,
+                    'scores': selected_scores,
+                    'label_preds': selected_labels
+                }
 
-            prediction_dicts.append(prediction_dict)
+                prediction_dicts.append(prediction_dict)
 
         return prediction_dicts 
-
-import numpy as np 
-def _circle_nms(boxes, min_radius, post_max_size=83):
-    """
-    NMS according to center distance
-    """
-    keep = np.array(circle_nms(boxes.cpu().numpy(), thresh=min_radius))[:post_max_size]
-
-    keep = torch.from_numpy(keep).long().to(boxes.device)
-
-    return keep  

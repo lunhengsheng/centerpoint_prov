@@ -31,8 +31,26 @@ class Reformat(object):
             coordinates=voxels["coordinates"]
         )
 
+        calib = res.get("calib", None)
+        if calib:
+            data_bundle["calib"] = calib
+
+        image = res.get("image", None)
+        if image:
+            data_bundle["image"] = image
+
         if res["mode"] == "train":
             data_bundle.update(res["lidar"]["targets"])
+            ground_plane = res["lidar"].get("ground_plane", None)
+
+            if ground_plane:
+                data_bundle["ground_plane"] = ground_plane
+
+
+        if res["mode"] != "test":
+            annos = res["lidar"]["annotations"]
+            data_bundle.update(annos=annos,)
+
         elif res["mode"] == "val":
             data_bundle.update(dict(metadata=meta, ))
 

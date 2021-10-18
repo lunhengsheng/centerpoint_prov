@@ -13,12 +13,37 @@ import pickle
 import os 
 from ..registry import PIPELINES
 
+from det3d.datasets.kitti import kitti_common as kitti
+
+from pypcd import pypcd
+
 def _dict_select(dict_, inds):
     for k, v in dict_.items():
         if isinstance(v, dict):
             _dict_select(v, inds)
         else:
             dict_[k] = v[inds]
+
+
+
+def load_pcd(path):
+    cloud = pypcd.PointCloud.from_path(path)
+    points = np.column_stack((cloud.pc_data['x'],
+                            cloud.pc_data['y'], 
+                            cloud.pc_data['z'] + 6.0,
+                            cloud.pc_data['intensity'],
+                            cloud.pc_data['reflectivity'].astype('float32')
+    ))
+
+
+    #print("cloud.pc_data[z] type: ", cloud.pc_data['z'].dtype)
+    #print("cloud.pc_data[t] type: ", cloud.pc_data['t'].astype('float32').dtype)
+    #fake_timestamp = np.zeros((points.shape[0],1), dtype=np.float32)
+    #points = np.append(points, fake_timestamp, axis=1)
+
+    
+    return points
+
 
 def read_file(path, tries=2, num_point_feature=4, painted=False):
     if painted:
@@ -27,6 +52,8 @@ def read_file(path, tries=2, num_point_feature=4, painted=False):
         points =  np.load(painted_path)
         points = points[:, [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]] # remove ring_index from features 
     else:
+
+        print(path)
         points = np.fromfile(path, dtype=np.float32).reshape(-1, 5)[:, :num_point_feature]
 
     return points
@@ -108,7 +135,28 @@ class LoadPointCloudFromFile(object):
 
         res["type"] = self.type
 
-        if self.type == "NuScenesDataset":
+        if self.type == "KittiDataset":
+
+            pc_info = info["point_cloud"]
+            velo_path = Path(pc_info["velodyne_path"])
+            if not velo_path.is_absolute():
+                velo_path = (
+                    Path(res["metadata"]["image_prefix"]) / pc_info["velodyne_path"]
+                )
+            velo_reduced_path = (
+                velo_path.parent.parent
+                / (velo_path.parent.stem + "_reduced")
+                / velo_path.name
+            )
+            if velo_reduced_path.exists():
+                velo_path = velo_reduced_path
+            points = np.fromfile(str(velo_path), dtype=np.float32, count=-1).reshape(
+                [-1, res["metadata"]["num_point_features"]]
+            )
+
+            res["lidar"]["points"] = points
+
+        elif self.type == "NuScenesDataset":
 
             nsweeps = res["lidar"]["nsweeps"]
 
@@ -136,6 +184,8 @@ class LoadPointCloudFromFile(object):
             res["lidar"]["points"] = points
             res["lidar"]["times"] = times
             res["lidar"]["combined"] = np.hstack([points, times])
+
+            
         
         elif self.type == "WaymoDataset":
             path = info['path']
@@ -166,6 +216,37 @@ class LoadPointCloudFromFile(object):
                 res["lidar"]["points"] = points
                 res["lidar"]["times"] = times
                 res["lidar"]["combined"] = np.hstack([points, times])
+
+        elif self.type == "ProvidentiaDataset":
+            lidar_path = Path(info['lidar_path'])
+            nsweeps = res["lidar"]["nsweeps"]
+            points = load_pcd(str(lidar_path))
+            res["lidar"]["points"] = points
+
+            print("points = load_pcd(str(lidar_path))", points.shape)
+
+            # if nsweeps > 1: 
+            #     sweep_points_list = [points]
+            #     sweep_times_list = [np.zeros((points.shape[0], 1))]
+
+            #     assert (nsweeps - 1) == len(
+            #         info["sweeps"]
+            #     ), "nsweeps {} should be equal to the list length {}.".format(
+            #         nsweeps, len(info["sweeps"])
+            #     )
+
+            #     for i in range(nsweeps - 1):
+            #         sweep = info["sweeps"][i]
+            #         points_sweep, times_sweep = read_single_waymo_sweep(sweep)
+            #         sweep_points_list.append(points_sweep)
+            #         sweep_times_list.append(times_sweep)
+
+            #     points = np.concatenate(sweep_points_list, axis=0)
+            #     times = np.concatenate(sweep_times_list, axis=0).astype(points.dtype)
+
+            #     res["lidar"]["points"] = points
+            #     res["lidar"]["times"] = times
+            #     res["lidar"]["combined"] = np.hstack([points, times])
         else:
             raise NotImplementedError
 
@@ -188,11 +269,62 @@ class LoadPointCloudAnnotations(object):
                 "tokens": info["gt_boxes_token"],
                 "velocities": info["gt_boxes_velocity"].astype(np.float32),
             }
-        elif res["type"] == 'WaymoDataset' and "gt_boxes" in info:
+        elif res["type"] == 'WaymoDataset' or res["type"] == "ProvidentiaDataset" and "gt_boxes" in info:
             res["lidar"]["annotations"] = {
                 "boxes": info["gt_boxes"].astype(np.float32),
                 "names": info["gt_names"],
             }
+        elif res["type"] == "KittiDataset":
+
+            calib = info["calib"]
+            calib_dict = {
+                "rect": calib["R0_rect"],
+                "Trv2c": calib["Tr_velo_to_cam"],
+                "P2": calib["P2"],
+            }
+            res["calib"] = calib_dict
+
+            image_info = info["image"]
+            image_dict = {
+                "image_shape": np.array(image_info["image_shape"], dtype=np.int32),
+                "image_idx": image_info["image_idx"],
+                "image_path": image_info["image_path"],
+            }
+            res["image"] = image_dict
+
+            if "annos" in info:
+                annos = info["annos"]
+                # we need other objects to avoid collision when sample
+                annos = kitti.remove_dontcare(annos)
+                locs = annos["location"]
+
+                dims = annos["dimensions"]
+                vels = np.zeros((locs.shape[0], 2))
+                rots = annos["rotation_y"]
+            
+                gt_names = annos["name"]
+                gt_boxes = np.concatenate(
+                    [locs, dims, rots[..., np.newaxis]], axis=1
+                ).astype(np.float32)
+
+                calib = info["calib"]
+                gt_boxes = box_np_ops.box_camera_to_lidar(
+                    gt_boxes, calib["R0_rect"], calib["Tr_velo_to_cam"]
+                )
+
+                # only center format is allowed. so we need to convert
+                # kitti [0.5, 0.5, 0] center to [0.5, 0.5, 0.5]
+                box_np_ops.change_box3d_center_(
+                    gt_boxes, [0.5, 0.5, 0], [0.5, 0.5, 0.5]
+                )
+                res["lidar"]["annotations"] = {
+                    "boxes": gt_boxes,
+                    "names": gt_names,
+                }
+                res["cam"]["annotations"] = {
+                    "boxes": annos["bbox"],
+                    "names": gt_names,
+                }
         else:
             pass 
 

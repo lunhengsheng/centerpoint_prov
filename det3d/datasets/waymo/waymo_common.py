@@ -297,6 +297,7 @@ def sort_frame(frames):
 def get_available_frames(root, split):
     dir_path = os.path.join(root, split, 'lidar')
     available_frames = list(os.listdir(dir_path))
+    print(available_frames)
 
     sorted_frames = sort_frame(available_frames)
 

@@ -10,7 +10,7 @@ from torch import nn
 from torch.nn import functional as F
 from ..registry import BACKBONES, READERS
 from ..utils import build_norm_layer
-
+#from det3d.ops.voxel import DynamicScatter
 
 class PFNLayer(nn.Module):
     def __init__(self, in_channels, out_channels, norm_cfg=None, last_layer=False):
@@ -81,14 +81,14 @@ class PillarFeatureNet(nn.Module):
         self.name = "PillarFeatureNet"
         assert len(num_filters) > 0
 
-        self.num_input = num_input_features
-        num_input_features += 5
+        self.num_input_features = num_input_features
+        self.num_input_features += 5
         if with_distance:
-            num_input_features += 1
+            self.num_input_features += 1
         self._with_distance = with_distance
 
         # Create PillarFeatureNet layers
-        num_filters = [num_input_features] + list(num_filters)
+        num_filters = [self.num_input_features] + list(num_filters)
         pfn_layers = []
         for i in range(len(num_filters) - 1):
             in_filters = num_filters[i]
@@ -105,6 +105,7 @@ class PillarFeatureNet(nn.Module):
         self.pfn_layers = nn.ModuleList(pfn_layers)
 
         # Need pillar (voxel) size and x/y offset in order to calculate pillar offset
+        self.pc_range = pc_range
         self.vx = voxel_size[0]
         self.vy = voxel_size[1]
         self.x_offset = self.vx / 2 + pc_range[0]
@@ -146,12 +147,165 @@ class PillarFeatureNet(nn.Module):
         mask = torch.unsqueeze(mask, -1).type_as(features)
         features *= mask
 
+        batch_dict = dict()
+
         # Forward pass through PFNLayers
         for pfn in self.pfn_layers:
             features = pfn(features)
 
-        return features.squeeze()
+        batch_dict["pillar_features"] = features.squeeze()
 
+        return batch_dict
+
+@READERS.register_module
+class DynamicPillarFeatureNet(PillarFeatureNet):
+    """Pillar Feature Net using dynamic voxelization.
+    The network prepares the pillar features and performs forward pass
+    through PFNLayers. The main difference is that it is used for
+    dynamic voxels, which contains different number of points inside a voxel
+    without limits.
+    Args:
+        num_input_features (int, optional): Number of input features,
+            either x, y, z or x, y, z, r. Defaults to 4.
+        num_filters (tuple, optional): Number of features in each of the
+            N PFNLayers. Defaults to (64, ).
+        with_distance (bool, optional): Whether to include Euclidean distance
+            to points. Defaults to False.
+        with_cluster_center (bool, optional): [description]. Defaults to True.
+        with_voxel_center (bool, optional): [description]. Defaults to True.
+        voxel_size (tuple[float], optional): Size of voxels, only utilize x
+            and y size. Defaults to (0.2, 0.2, 4).
+        pc_range (tuple[float], optional): Point cloud range, only
+            utilizes x and y min. Defaults to (0, -40, -3, 70.4, 40, 1).
+        norm_cfg ([type], optional): [description].
+            Defaults to dict(type='BN1d', eps=1e-3, momentum=0.01).
+        mode (str, optional): The mode to gather point features. Options are
+            'max' or 'avg'. Defaults to 'max'.
+    """
+
+    def __init__(self,
+                 num_input_features=4,
+                 num_filters=(64, ),
+                 with_distance=False,
+                 voxel_size=(0.2, 0.2, 4),
+                 pc_range=(0, -40, -3, 70.4, 40, 1),
+                 norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01),
+                 ):
+        super(DynamicPillarFeatureNet, self).__init__(
+            num_input_features,
+            num_filters,
+            with_distance,
+            voxel_size=voxel_size,
+            pc_range=pc_range,
+            norm_cfg=norm_cfg,
+            )
+        self.fp16_enabled = False
+        num_filters = [self.num_input_features] + list(num_filters)
+        pfn_layers = []
+        # TODO: currently only support one PFNLayer
+
+        for i in range(len(num_filters) - 1):
+            in_filters = num_filters[i]
+            out_filters = num_filters[i + 1]
+            if i > 0:
+                in_filters *= 2
+            norm_name, norm_layer = build_norm_layer(norm_cfg, out_filters)
+            pfn_layers.append(
+                nn.Sequential(
+                    nn.Linear(in_filters, out_filters, bias=False), norm_layer,
+                    nn.ReLU(inplace=True)))
+        self.num_pfn = len(pfn_layers)
+        self.pfn_layers = nn.ModuleList(pfn_layers)
+        self.pfn_scatter = DynamicScatter(voxel_size, pc_range,
+                                         average_points=False)
+        self.cluster_scatter = DynamicScatter(
+            voxel_size, pc_range, average_points=True)
+
+    def map_voxel_center_to_point(self, pts_coors, voxel_mean, voxel_coors):
+        """Map the centers of voxels to its corresponding points.
+        Args:
+            pts_coors (torch.Tensor): The coordinates of each points, shape
+                (M, 3), where M is the number of points.
+            voxel_mean (torch.Tensor): The mean or aggreagated features of a
+                voxel, shape (N, C), where N is the number of voxels.
+            voxel_coors (torch.Tensor): The coordinates of each voxel.
+        Returns:
+            torch.Tensor: Corresponding voxel centers of each points, shape
+                (M, C), where M is the numver of points.
+        """
+        # Step 1: scatter voxel into canvas
+        # Calculate necessary things for canvas creation
+        canvas_y = int(
+            (self.pc_range[4] - self.pc_range[1]) / self.vy)
+        canvas_x = int(
+            (self.pc_range[3] - self.pc_range[0]) / self.vx)
+        canvas_channel = voxel_mean.size(1)
+        batch_size = pts_coors[-1, 0] + 1
+        canvas_len = canvas_y * canvas_x * batch_size
+        # Create the canvas for this sample
+        canvas = voxel_mean.new_zeros(canvas_channel, canvas_len)
+        # Only include non-empty pillars
+        indices = (
+            voxel_coors[:, 0] * canvas_y * canvas_x +
+            voxel_coors[:, 2] * canvas_x + voxel_coors[:, 3])
+        # Scatter the blob back to the canvas
+        canvas[:, indices.long()] = voxel_mean.t()
+
+        # Step 2: get voxel mean for each point
+        voxel_index = (
+            pts_coors[:, 0] * canvas_y * canvas_x +
+            pts_coors[:, 2] * canvas_x + pts_coors[:, 3])
+        center_per_point = canvas[:, voxel_index.long()].t()
+        return center_per_point
+
+    def forward(self, features, coors):
+        """Forward function.
+        Args:
+            features (torch.Tensor): Point features or raw points in shape
+                (N, M, C).
+            coors (torch.Tensor): Coordinates of each voxel
+        Returns:
+            torch.Tensor: Features of pillars.
+        """
+        features_ls = [features]
+        # Find distance of x, y, and z from cluster center
+        
+        voxel_mean, mean_coors = self.cluster_scatter(features, coors)
+        points_mean = self.map_voxel_center_to_point(
+            coors, voxel_mean, mean_coors)
+        # TODO: maybe also do cluster for reflectivity
+        f_cluster = features[:, :3] - points_mean[:, :3]
+        features_ls.append(f_cluster)
+
+        # Find distance of x, y, and z from pillar center
+    
+        f_center = features.new_zeros(size=(features.size(0), 2))
+        f_center[:, 0] = features[:, 0] - (
+            coors[:, 3].type_as(features) * self.vx + self.x_offset)
+        f_center[:, 1] = features[:, 1] - (
+            coors[:, 2].type_as(features) * self.vy + self.y_offset)
+        features_ls.append(f_center)
+
+        if self._with_distance:
+            points_dist = torch.norm(features[:, :3], 2, 1, keepdim=True)
+            features_ls.append(points_dist)
+        
+        batch_dict = dict()
+
+        # Combine together feature decorations
+        features = torch.cat(features_ls, dim=-1)
+        for i, pfn in enumerate(self.pfn_layers):
+            point_feats = pfn(features)
+            voxel_feats, voxel_coors = self.pfn_scatter(point_feats, coors)
+            if i != len(self.pfn_layers) - 1:
+                # need to concat voxel feats if it is not the last pfn
+                feat_per_point = self.map_voxel_center_to_point(
+                    coors, voxel_feats, voxel_coors)
+                features = torch.cat([point_feats, feat_per_point], dim=1)
+
+        batch_dict["pillar_features"] = voxel_feats
+        batch_dict["feature_coors"] = voxel_coors
+        return batch_dict
 
 @BACKBONES.register_module
 class PointPillarsScatter(nn.Module):
@@ -170,10 +324,15 @@ class PointPillarsScatter(nn.Module):
         self.name = "PointPillarsScatter"
         self.nchannels = num_input_features
 
-    def forward(self, voxel_features, coords, batch_size, input_shape):
+    def forward(self, batch_dict, coords, batch_size, input_shape):
 
         self.nx = input_shape[0]
         self.ny = input_shape[1]
+
+        voxel_features = batch_dict["pillar_features"]
+        batch_dict["voxel_coords"] = coords
+
+        batch_dict["batch_size"] = batch_size
 
         # batch_canvas will be the final output.
         batch_canvas = []
@@ -206,4 +365,6 @@ class PointPillarsScatter(nn.Module):
 
         # Undo the column stacking to final 4-dim tensor
         batch_canvas = batch_canvas.view(batch_size, self.nchannels, self.ny, self.nx)
-        return batch_canvas
+        batch_dict["spatial_features"] = batch_canvas
+
+        return batch_dict

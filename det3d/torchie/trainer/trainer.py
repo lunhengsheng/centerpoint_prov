@@ -66,6 +66,7 @@ def example_to_device(example, device, non_blocking=False) -> dict:
 def parse_second_losses(losses):
 
     log_vars = OrderedDict()
+
     loss = sum(losses["loss"])
     for loss_name, loss_value in losses.items():
         if loss_name == "loc_loss_elem":
@@ -366,6 +367,25 @@ class Trainer(object):
 
         if train_mode:
             losses = model(example, return_loss=True)
+            # if "flag" in losses:
+            #     if losses["flag"]==0:
+            #         outputs = {}
+            #         return outputs
+            #     else:
+            #         self.call_hook("after_forward")
+            #         del losses["flag"]
+            #         loss, log_vars = parse_second_losses(losses)
+            #         del losses
+
+            #         outputs = dict(
+            #             loss=loss, log_vars=log_vars, num_samples=-1  # TODO: FIX THIS
+            #         )
+            #         self.call_hook("after_parse_loss")
+
+            #         return outputs
+
+
+            #else: 
             self.call_hook("after_forward")
             loss, log_vars = parse_second_losses(losses)
             del losses
@@ -383,6 +403,10 @@ class Trainer(object):
 
         self.model.train()
         self.mode = "train"
+
+        # print("PARAMETERS in train mode: ")
+        # for p, name in self.model.named_parameters():
+        #     print(p,name)
         self.data_loader = data_loader
         self.length = len(data_loader)
         self._max_iters = self._max_epochs * self.length
@@ -412,6 +436,8 @@ class Trainer(object):
 
             if not isinstance(outputs, dict):
                 raise TypeError("batch_processor() must return a dict")
+
+            #if not outputs:
             if "log_vars" in outputs:
                 self.log_buffer.update(outputs["log_vars"], outputs["num_samples"])
             self.outputs = outputs
@@ -426,6 +452,7 @@ class Trainer(object):
         self.mode = "val"
         self.data_loader = data_loader
         self.call_hook("before_val_epoch")
+
 
         self.logger.info(f"work dir: {self.work_dir}")
 

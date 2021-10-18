@@ -22,8 +22,24 @@ class BaseDetector(nn.Module):
         return hasattr(self, "reader") and self.reader is not None
 
     @property
+    def with_backbone(self):
+        return hasattr(self, "backbone") and self.backbone is not None
+
+    @property
+    def with_encoder2d(self):
+        return hasattr(self, "encoder2d") and self.encoder2d is not None
+    
+    @property
     def with_neck(self):
         return hasattr(self, "neck") and self.neck is not None
+
+    @property
+    def with_cfe(self):
+        return hasattr(self, "cfe") and self.cfe is not None
+    
+    @property
+    def with_decoder2d(self):
+        return hasattr(self, "decoder2d") and self.decoder2d is not None
 
     @property
     def with_shared_head(self):

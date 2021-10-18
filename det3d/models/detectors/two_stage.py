@@ -143,7 +143,7 @@ class TwoStageDetector(BaseDetector):
                 'box3d_lidar': box_preds,
                 'scores': scores,
                 'label_preds': labels,
-                "metadata": batch_dict["metadata"][index]
+                 #"metadata": batch_dict["metadata"][index]
             }
 
             pred_dicts.append(pred_dict)

@@ -1,6 +1,7 @@
 import numpy as np
 import numba
 
+
 from det3d.ops.nms.nms_gpu import rotate_iou_gpu_eval
 from det3d.ops.nms.nms_gpu import inter
 from det3d.core import box_np_ops
@@ -364,4 +365,208 @@ def box3d_overlap(boxes, qboxes, criterion=-1, z_axis=1, z_center=1.0):
     bev_axes.pop(z_axis)
     rinc = rotate_iou_gpu_eval(boxes[:, bev_axes], qboxes[:, bev_axes], 2)
     box3d_overlap_kernel(boxes, qboxes, rinc, criterion, z_axis, z_center)
+    return rinc
+
+
+
+
+# pang added to build the tensor for the second stage of training
+@numba.jit(nopython=True,parallel=True)
+def build_stage2_training(boxes, query_boxes, scores_3d, scores_2d, dis_to_lidar_3d,overlaps,tensor_index):
+    N = boxes.shape[0] #70400
+    K = query_boxes.shape[0] #30
+    max_num = 900000
+    ind=0
+    ind_max = ind
+
+
+    print("N in build_input_tensor is: ", N)
+    print("K in build_input_tensor is: ", K)
+
+
+
+    for k in range(K):
+
+        qbox_area = ((query_boxes[k, 2] - query_boxes[k, 0]) *
+                     (query_boxes[k, 3] - query_boxes[k, 1]))
+        
+
+        for n in range(N):
+
+            iw = (min(boxes[n, 2], query_boxes[k, 2]) -
+                max(boxes[n, 0], query_boxes[k, 0]))
+            if iw > 0:
+                ih = (min(boxes[n, 3], query_boxes[k, 3]) -
+                    max(boxes[n, 1], query_boxes[k, 1]))
+
+                if ih > 0:
+                    overlaps[ind,0] = iw * ih / qbox_area
+                    overlaps[ind,1] = scores_3d[n,0]
+                    overlaps[ind,2] = scores_2d[k,0]
+                    overlaps[ind,3] = dis_to_lidar_3d[n,0]
+                    tensor_index[ind,0] = k
+                    tensor_index[ind,1] = n
+                    ind = ind+1
+
+                elif k==K-1:
+                    overlaps[ind,0] = -100
+                    overlaps[ind,1] = scores_3d[n,0]
+                    overlaps[ind,2] = -100
+                    overlaps[ind,3] = dis_to_lidar_3d[n,0]
+                    tensor_index[ind,0] = k
+                    tensor_index[ind,1] = n
+                    ind = ind+1
+            elif k==K-1:
+                overlaps[ind,0] = -100
+                overlaps[ind,1] = scores_3d[n,0]
+                overlaps[ind,2] = -100
+                overlaps[ind,3] = dis_to_lidar_3d[n,0]
+                tensor_index[ind,0] = k
+                tensor_index[ind,1] = n
+                ind = ind+1
+    if ind > ind_max:
+        ind_max = ind
+        
+    return overlaps, tensor_index, ind
+
+# pang added to build the tensor for the second stage of training
+@numba.jit(nopython=True,parallel=True)
+def build_stage2_training_ext(boxes, query_boxes, criterion, scores_3d, scores_2d, dis_to_lidar_3d,overlaps,tensor_index):
+    N = boxes.shape[0] #70400
+    K = query_boxes[0].shape[0] #30
+    max_num = 900000
+
+    print("N in build_input_tensor is: ", N)
+    print("K in build_input_tensor is: ", K)
+
+    inds = []
+    ind=0
+    ind_max = ind
+    for k in range(K):
+
+        for i in range(query_boxes.shape[0]):
+            qbox_area = ((query_boxes[i,k, 2] - query_boxes[i,k, 0]) *
+                        (query_boxes[i,k, 3] - query_boxes[i,k, 1]))
+            for n in range(N):
+                iw = (min(boxes[n, 2], query_boxes[i,k, 2]) -
+                    max(boxes[n, 0], query_boxes[i,k, 0]))
+                if iw > 0:
+                    ih = (min(boxes[n, 3], query_boxes[i,k, 3]) -
+                        max(boxes[n, 1], query_boxes[i,k, 1]))
+                    if ih > 0:
+                        if criterion == -1:
+                            ua = (
+                                (boxes[n, 2] - boxes[n, 0]) *
+                                (boxes[n, 3] - boxes[n, 1]) + qbox_area - iw * ih)
+                        elif criterion == 0:
+                            ua = ((boxes[n, 2] - boxes[n, 0]) *
+                                (boxes[n, 3] - boxes[n, 1]))
+                        elif criterion == 1:
+                            ua = qbox_area
+                        else:
+                            ua = 1.0
+                        overlaps[i,ind,0] = iw * ih / ua
+                        overlaps[i,ind,1] = scores_3d[n,i]
+                        overlaps[i,ind,2] = scores_2d[i,k,0]
+                        overlaps[i,ind,3] = dis_to_lidar_3d[n,0]
+                        tensor_index[i,ind,0] = k
+                        tensor_index[i,ind,1] = n
+                        ind = ind+1
+
+                    elif k==K-1:
+                        overlaps[i,ind,0] = -1000
+                        overlaps[i,ind,1] = scores_3d[n,i]
+                        overlaps[i,ind,2] = -1000
+                        overlaps[i,ind,3] = dis_to_lidar_3d[n,0]
+                        tensor_index[i,ind,0] = k
+                        tensor_index[i,ind,1] = n
+                        ind = ind+1
+                elif k==K-1:
+                    overlaps[i,ind,0] = -1000
+                    overlaps[i,ind,1] = scores_3d[n,i]
+                    overlaps[i,ind,2] = -1000
+                    overlaps[i,ind,3] = dis_to_lidar_3d[n,0]
+                    tensor_index[i,ind,0] = k
+                    tensor_index[i,ind,1] = n
+                    ind = ind+1
+
+            inds.append(ind)
+            ind = 0
+    if ind > ind_max:
+        ind_max = ind
+    return overlaps, tensor_index, inds
+
+
+# pang added to build the tensor for the second stage of training, added july 13 2019
+#@numba.jit(nopython=True, parallel=True)
+def build_stage2_training_2(boxes, query_boxes, box_2d_corner):
+    N = boxes.shape[0]  #3D_projected
+    K = query_boxes.shape[0]   #2D
+    overlaps_2 = np.zeros((N, K, 24), dtype=boxes.dtype)
+    for k in range(K):
+        qbox_area = ((query_boxes[k, 2] - query_boxes[k, 0]) *
+                     (query_boxes[k, 5] - query_boxes[k, 1]))
+        for n in range(N):
+            iw = (min(boxes[n, 2], query_boxes[k, 2]) -
+                  max(boxes[n, 0], query_boxes[k, 0]))
+            if iw > 0:
+                ih = (min(boxes[n, 3], query_boxes[k, 5]) -
+                      max(boxes[n, 1], query_boxes[k, 1]))
+                if ih > 0:
+                    overlaps_2[n, k, 0:8] = query_boxes[k,:]
+                    overlaps_2[n, k, 8:] = box_2d_corner[n,:]
+                    '''
+                    overlaps_2[n, k, 0] = query_boxes[k,0]
+                    overlaps_2[n, k, 1] = query_boxes[k,1]
+                    overlaps_2[n, k, 2] = query_boxes[k,2]
+                    overlaps_2[n, k, 3] = query_boxes[k,3]
+                    overlaps_2[n, k, 4] = box_2d_corner[n,0]
+                    overlaps_2[n, k, 5] = box_2d_corner[n,1]
+                    overlaps_2[n, k, 6] = box_2d_corner[n,2]
+                    overlaps_2[n, k, 7] = box_2d_corner[n,3]
+                    overlaps_2[n, k, 8] = box_2d_corner[n,4]
+                    overlaps_2[n, k, 9] = box_2d_corner[n,5]
+                    overlaps_2[n, k, 10] = box_2d_corner[n,6]
+                    overlaps_2[n, k, 11] = box_2d_corner[n,7]
+                    '''
+            '''
+            elif scores_3d[n,0] >= 0.1:
+                overlaps[n, k, 0] = 0
+                overlaps[n, k, 1] = scores_3d[n,0]
+                overlaps[n, k, 2] = 0
+                overlaps[n, k, 3] = dis_to_lidar_3d[n,0]'''
+    return overlaps_2
+
+
+@numba.jit(nopython=True, parallel=True)
+def d3_box_overlap_kernel(boxes, qboxes, rinc, criterion=-1):
+    # ONLY support overlap in CAMERA, not lider.
+    N, K = boxes.shape[0], qboxes.shape[0]
+    for i in range(N):
+        for j in range(K):
+            if rinc[i, j] > 0:
+                iw = (min(boxes[i, 1], qboxes[j, 1]) - max(
+                    boxes[i, 1] - boxes[i, 4], qboxes[j, 1] - qboxes[j, 4]))
+
+                if iw > 0:
+                    area1 = boxes[i, 3] * boxes[i, 4] * boxes[i, 5]
+                    area2 = qboxes[j, 3] * qboxes[j, 4] * qboxes[j, 5]
+                    inc = iw * rinc[i, j]
+                    if criterion == -1:
+                        ua = (area1 + area2 - inc)
+                    elif criterion == 0:
+                        ua = area1
+                    elif criterion == 1:
+                        ua = area2
+                    else:
+                        ua = 1.0
+                    rinc[i, j] = inc / ua
+                else:
+                    rinc[i, j] = 0.0
+
+
+def d3_box_overlap(boxes, qboxes, criterion=-1):
+    rinc = rotate_iou_gpu_eval(boxes[:, [0, 2, 3, 5, 6]],
+                               qboxes[:, [0, 2, 3, 5, 6]], 2)
+    d3_box_overlap_kernel(boxes, qboxes, rinc, criterion)
     return rinc

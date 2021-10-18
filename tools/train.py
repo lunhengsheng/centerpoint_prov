@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import yaml
 from det3d.datasets import build_dataset
-from det3d.models import build_detector
+from det3d.models import build_detector, build_fusion
 from det3d.torchie import Config
 from det3d.torchie.apis import (
     build_optimizer,
@@ -107,7 +107,10 @@ def main():
         logger.info("Set random seed to {}".format(args.seed))
         set_random_seed(args.seed)
 
-    model = build_detector(cfg.model, train_cfg=cfg.train_cfg, test_cfg=cfg.test_cfg)
+    if cfg.get("fusion", None) is not None:
+        model = build_fusion(cfg.fusion)
+    else:
+        model = build_detector(cfg.model, train_cfg=cfg.train_cfg, test_cfg=cfg.test_cfg)
 
     datasets = [build_dataset(cfg.data.train)]
 

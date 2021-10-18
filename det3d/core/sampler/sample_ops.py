@@ -181,16 +181,19 @@ class DataBaseSamplerV2:
                         str(pathlib.Path(root_path) / info["path"]), dtype=np.float32
                     ).reshape(-1, num_point_features)
 
+                    
+
                     if "rot_transform" in info:
                         rot = info["rot_transform"]
                         s_points[:, :3] = box_np_ops.rotation_points_single_angle(
                             s_points[:, :4], rot, axis=2
                         )
                     s_points[:, :3] += info["box3d_lidar"][:3]
+    
                     s_points_list.append(s_points)
                     # print(pathlib.Path(info["path"]).stem)
                 except Exception:
-                    print(str(pathlib.Path(root_path) / info["path"]))
+                    print("Exception!!!!!", str(pathlib.Path(root_path) / info["path"]))
                     continue
             if random_crop:
                 s_points_list_new = []
@@ -225,6 +228,8 @@ class DataBaseSamplerV2:
                 )
         else:
             ret = None
+
+        #print("sampled points shape ", ret["points"].shape)
         return ret
 
     def sample(self, name, num):

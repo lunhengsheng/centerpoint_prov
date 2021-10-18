@@ -1,5 +1,8 @@
 import numpy as np
 
+from det3d.datasets.kitti import kitti_common as kitti
+from det3d.core.evaluation.bbox_overlaps import bbox_overlaps
+
 from det3d.core.bbox import box_np_ops
 from det3d.core.sampler import preprocess as prep
 from det3d.builder import build_dbsampler
@@ -27,28 +30,46 @@ def drop_arrays_by_name(gt_names, used_classes):
 @PIPELINES.register_module
 class Preprocess(object):
     def __init__(self, cfg=None, **kwargs):
+        self.remove_environment = cfg.remove_environment
         self.shuffle_points = cfg.shuffle_points
+        self.remove_unknown = cfg.remove_unknown_examples
         self.min_points_in_gt = cfg.get("min_points_in_gt", -1)
-        
+        self.add_rgb_to_points = cfg.get("add_rgb_to_points", False)
+        self.reference_detections = cfg.get("reference_detections", None)
+        self.remove_outside_points = cfg.get("remove_outside_points", False)
+        self.random_crop = cfg.get("random_crop", False)
+
         self.mode = cfg.mode
         if self.mode == "train":
+            self.gt_rotation_noise = cfg.gt_rot_noise
+            self.gt_loc_noise_std = cfg.gt_loc_noise
             self.global_rotation_noise = cfg.global_rot_noise
             self.global_scaling_noise = cfg.global_scale_noise
+            self.global_random_rot_range = cfg.global_rot_per_obj_range
+            self.global_translate_noise_std = cfg.global_trans_noise
+            self.gt_points_drop = (cfg.gt_drop_percentage,)
+            self.remove_points_after_sample = cfg.remove_points_after_sample
             self.class_names = cfg.class_names
-            if cfg.db_sampler != None:
-                self.db_sampler = build_dbsampler(cfg.db_sampler)
-            else:
-                self.db_sampler = None 
-                
+            self.db_sampler = build_dbsampler(cfg.db_sampler)
             self.npoints = cfg.get("npoints", -1)
+            self.random_select = cfg.get("random_select", False)
 
-        self.no_augmentation = cfg.get('no_augmentation', False)
+        self.symmetry_intensity = cfg.get("symmetry_intensity", False)
 
     def __call__(self, res, info):
 
         res["mode"] = self.mode
 
-        if res["type"] in ["WaymoDataset"]:
+
+        if res["type"] in ["KittiDataset"]:
+            points = res["lidar"]["points"]
+
+        elif res["type"] in ["WaymoDataset"]:
+            if "combined" in res["lidar"]:
+                points = res["lidar"]["combined"]
+            else:
+                points = res["lidar"]["points"]
+        elif res["type"] in ["ProvidentiaDataset"]:
             if "combined" in res["lidar"]:
                 points = res["lidar"]["combined"]
             else:
@@ -58,6 +79,7 @@ class Preprocess(object):
         else:
             raise NotImplementedError
 
+
         if self.mode == "train":
             anno_dict = res["lidar"]["annotations"]
 
@@ -66,14 +88,74 @@ class Preprocess(object):
                 "gt_names": np.array(anno_dict["names"]).reshape(-1),
             }
 
-        if self.mode == "train" and not self.no_augmentation:
-            selected = drop_arrays_by_name(
-                gt_dict["gt_names"], ["DontCare", "ignore", "UNKNOWN"]
+            if "difficulty" not in anno_dict:
+                difficulty = np.zeros([anno_dict["boxes"].shape[0]], dtype=np.int32)
+                gt_dict["difficulty"] = difficulty
+            else:
+                gt_dict["difficulty"] = anno_dict["difficulty"]
+
+        if "calib" in res:
+            calib = res["calib"]
+        else:
+            calib = None
+
+        if self.add_rgb_to_points:
+            assert calib is not None and "image" in res
+            image_path = res["image"]["image_path"]
+            image = (
+                imgio.imread(str(pathlib.Path(root_path) / image_path)).astype(
+                    np.float32
+                )
+                / 255
+            )
+            points_rgb = box_np_ops.add_rgb_to_points(
+                points, image, calib["rect"], calib["Trv2c"], calib["P2"]
+            )
+            points = np.concatenate([points, points_rgb], axis=1)
+            num_point_features += 3
+
+        if self.reference_detections is not None:
+            assert calib is not None and "image" in res
+            C, R, T = box_np_ops.projection_matrix_to_CRT_kitti(P2)
+            frustums = box_np_ops.get_frustum_v2(reference_detections, C)
+            frustums -= T
+            frustums = np.einsum("ij, akj->aki", np.linalg.inv(R), frustums)
+            frustums = box_np_ops.camera_to_lidar(frustums, rect, Trv2c)
+            surfaces = box_np_ops.corner_to_surfaces_3d_jit(frustums)
+            masks = points_in_convex_polygon_3d_jit(points, surfaces)
+            points = points[masks.any(-1)]
+
+        if self.remove_outside_points:
+            assert calib is not None
+            image_shape = res["image"]["image_shape"]
+            points = box_np_ops.remove_outside_points(
+                points, calib["rect"], calib["Trv2c"], calib["P2"], image_shape
+            )
+        if self.remove_environment is True and self.mode == "train":
+            selected = kitti.keep_arrays_by_name(gt_names, target_assigner.classes)
+            _dict_select(gt_dict, selected)
+            masks = box_np_ops.points_in_rbbox(points, gt_dict["gt_boxes"])
+            points = points[masks.any(-1)]
+
+        if self.mode == "train":
+            selected = kitti.drop_arrays_by_name(
+                gt_dict["gt_names"], ["DontCare", "ignore"]
             )
 
             _dict_select(gt_dict, selected)
+            if self.remove_unknown:
+                remove_mask = gt_dict["difficulty"] == -1
+                """
+                gt_boxes_remove = gt_boxes[remove_mask]
+                gt_boxes_remove[:, 3:6] += 0.25
+                points = prep.remove_points_in_boxes(points, gt_boxes_remove)
+                """
+                keep_mask = np.logical_not(remove_mask)
+                _dict_select(gt_dict, keep_mask)
+            gt_dict.pop("difficulty")
 
             if self.min_points_in_gt > 0:
+                # points_count_rbbox takes 10ms with 10 sweeps nuscenes data
                 point_counts = box_np_ops.points_count_rbbox(
                     points, gt_dict["gt_boxes"]
                 )
@@ -90,10 +172,9 @@ class Preprocess(object):
                     gt_dict["gt_boxes"],
                     gt_dict["gt_names"],
                     res["metadata"]["num_point_features"],
-                    False,
+                    self.random_crop,
                     gt_group_ids=None,
-                    calib=None,
-                    road_planes=None
+                    calib=calib,
                 )
 
                 if sampled_dict is not None:
@@ -111,8 +192,21 @@ class Preprocess(object):
                         [gt_boxes_mask, sampled_gt_masks], axis=0
                     )
 
+                    if self.remove_points_after_sample:
+                        masks = box_np_ops.points_in_rbbox(points, sampled_gt_boxes)
+                        points = points[np.logical_not(masks.any(-1))]
 
                     points = np.concatenate([sampled_points, points], axis=0)
+            prep.noise_per_object_v3_(
+                gt_dict["gt_boxes"],
+                points,
+                gt_boxes_mask,
+                rotation_perturb=self.gt_rotation_noise,
+                center_noise_std=self.gt_loc_noise_std,
+                global_random_rot_range=self.global_random_rot_range,
+                group_ids=None,
+                num_try=100,
+            )
 
             _dict_select(gt_dict, gt_boxes_mask)
 
@@ -122,7 +216,11 @@ class Preprocess(object):
             )
             gt_dict["gt_classes"] = gt_classes
 
-            gt_dict["gt_boxes"], points = prep.random_flip_both(gt_dict["gt_boxes"], points)
+            if res["type"] in ["NuScenesDataset"]:
+                # double flip gives 3 map improvement for pointppillars on nuScenes 
+                gt_dict["gt_boxes"], points = prep.random_flip_both(gt_dict["gt_boxes"], points)
+            else:
+                gt_dict["gt_boxes"], points = prep.random_flip(gt_dict["gt_boxes"], points)
             
             gt_dict["gt_boxes"], points = prep.global_rotation(
                 gt_dict["gt_boxes"], points, rotation=self.global_rotation_noise
@@ -130,25 +228,46 @@ class Preprocess(object):
             gt_dict["gt_boxes"], points = prep.global_scaling_v2(
                 gt_dict["gt_boxes"], points, *self.global_scaling_noise
             )
-        elif self.no_augmentation:
-            gt_boxes_mask = np.array(
-                [n in self.class_names for n in gt_dict["gt_names"]], dtype=np.bool_
-            )
-            _dict_select(gt_dict, gt_boxes_mask)
-
-            gt_classes = np.array(
-                [self.class_names.index(n) + 1 for n in gt_dict["gt_names"]],
-                dtype=np.int32,
-            )
-            gt_dict["gt_classes"] = gt_classes
-
 
         if self.shuffle_points:
+            # shuffle is a little slow.
             np.random.shuffle(points)
+
+        if self.mode == "train" and self.random_select:
+            if self.npoints < points.shape[0]:
+                pts_depth = points[:, 2]
+                pts_near_flag = pts_depth < 40.0
+                far_idxs_choice = np.where(pts_near_flag == 0)[0]
+                near_idxs = np.where(pts_near_flag == 1)[0]
+                near_idxs_choice = np.random.choice(
+                    near_idxs, self.npoints - len(far_idxs_choice), replace=False
+                )
+
+                choice = (
+                    np.concatenate((near_idxs_choice, far_idxs_choice), axis=0)
+                    if len(far_idxs_choice) > 0
+                    else near_idxs_choice
+                )
+                np.random.shuffle(choice)
+            else:
+                choice = np.arange(0, len(points), dtype=np.int32)
+                if self.npoints > len(points):
+                    extra_choice = np.random.choice(
+                        choice, self.npoints - len(points), replace=False
+                    )
+                    choice = np.concatenate((choice, extra_choice), axis=0)
+                np.random.shuffle(choice)
+
+            points = points[choice]
+
+        if self.symmetry_intensity:
+            points[:, -1] -= 0.5  # translate intensity to [-0.5, 0.5]
+            # points[:, -1] *= 2
 
         res["lidar"]["points"] = points
 
         if self.mode == "train":
+
             res["lidar"]["annotations"] = gt_dict
 
         return res, info
@@ -333,9 +452,20 @@ class AssignLabel(object):
             # print(gt_dict.keys())
             gt_dict["gt_classes"] = task_classes
             gt_dict["gt_names"] = task_names
-            gt_dict["gt_boxes"] = task_boxes
 
-            res["lidar"]["annotations"] = gt_dict
+
+            if res['type'] == 'KittiDataset':
+
+                task_boxes_original = task_boxes.copy()
+                # add fake vx and vy velocities to kitti boxes
+                for i in range(len(task_boxes)):
+
+                    task_boxes[i] = np.concatenate((task_boxes[i][:,0:7], np.zeros((task_boxes[i].shape[0], 2)), task_boxes[i][:, -1][...,np.newaxis]), axis=1)
+
+            gt_dict["gt_boxes"] = task_boxes
+    
+
+
 
             draw_gaussian = draw_umich_gaussian
 
@@ -345,10 +475,16 @@ class AssignLabel(object):
                 hm = np.zeros((len(class_names_by_task[idx]), feature_map_size[1], feature_map_size[0]),
                               dtype=np.float32)
 
-                if res['type'] == 'NuScenesDataset':
+                if res['type'] == 'KittiDataset':
+                    # [reg, hei, dim, vx, vy, rots, rotc]
+                    anno_box = np.zeros((max_objs, 10), dtype=np.float32)
+
+                elif res['type'] == 'NuScenesDataset':
                     # [reg, hei, dim, vx, vy, rots, rotc]
                     anno_box = np.zeros((max_objs, 10), dtype=np.float32)
                 elif res['type'] == 'WaymoDataset':
+                    anno_box = np.zeros((max_objs, 10), dtype=np.float32)
+                elif res['type'] == 'ProvidentiaDataset':
                     anno_box = np.zeros((max_objs, 10), dtype=np.float32) 
                 else:
                     raise NotImplementedError("Only Support nuScene for Now!")
@@ -393,13 +529,26 @@ class AssignLabel(object):
                         ind[new_idx] = y * feature_map_size[0] + x
                         mask[new_idx] = 1
 
-                        if res['type'] == 'NuScenesDataset': 
+
+                        if res['type'] == 'KittiDataset': 
+                            vx, vy = gt_dict['gt_boxes'][idx][k][6:8]
+                            rot = gt_dict['gt_boxes'][idx][k][-1]
+                            anno_box[new_idx] = np.concatenate(
+                                (ct - (x, y), z, np.log(gt_dict['gt_boxes'][idx][k][3:6]),
+                                np.array(vx), np.array(vy), np.sin(rot), np.cos(rot)), axis=None)
+                        elif res['type'] == 'NuScenesDataset': 
                             vx, vy = gt_dict['gt_boxes'][idx][k][6:8]
                             rot = gt_dict['gt_boxes'][idx][k][8]
                             anno_box[new_idx] = np.concatenate(
                                 (ct - (x, y), z, np.log(gt_dict['gt_boxes'][idx][k][3:6]),
                                 np.array(vx), np.array(vy), np.sin(rot), np.cos(rot)), axis=None)
                         elif res['type'] == 'WaymoDataset':
+                            vx, vy = gt_dict['gt_boxes'][idx][k][6:8]
+                            rot = gt_dict['gt_boxes'][idx][k][-1]
+                            anno_box[new_idx] = np.concatenate(
+                            (ct - (x, y), z, np.log(gt_dict['gt_boxes'][idx][k][3:6]),
+                            np.array(vx), np.array(vy), np.sin(rot), np.cos(rot)), axis=None)
+                        elif res['type'] == 'ProvidentiaDataset':
                             vx, vy = gt_dict['gt_boxes'][idx][k][6:8]
                             rot = gt_dict['gt_boxes'][idx][k][-1]
                             anno_box[new_idx] = np.concatenate(
@@ -414,13 +563,19 @@ class AssignLabel(object):
                 inds.append(ind)
                 cats.append(cat)
 
+
             # used for two stage code 
             boxes = flatten(gt_dict['gt_boxes'])
+
             classes = merge_multi_group_label(gt_dict['gt_classes'], num_classes_by_task)
 
-            if res["type"] == "NuScenesDataset":
+            if res["type"] == "KittiDataset":
+                gt_boxes_and_cls = np.zeros((max_objs, 10), dtype=np.float32)
+            elif res["type"] == "NuScenesDataset":
                 gt_boxes_and_cls = np.zeros((max_objs, 10), dtype=np.float32)
             elif res['type'] == "WaymoDataset":
+                gt_boxes_and_cls = np.zeros((max_objs, 10), dtype=np.float32)
+            elif res['type'] == "ProvidentiaDataset":
                 gt_boxes_and_cls = np.zeros((max_objs, 10), dtype=np.float32)
             else:
                 raise NotImplementedError()
@@ -432,6 +587,14 @@ class AssignLabel(object):
             # x, y, z, w, l, h, rotation_y, velocity_x, velocity_y, class_name
             boxes_and_cls = boxes_and_cls[:, [0, 1, 2, 3, 4, 5, 8, 6, 7, 9]]
             gt_boxes_and_cls[:num_obj] = boxes_and_cls
+
+            if res['type'] == 'KittiDataset':
+
+                gt_dict["gt_boxes"] = task_boxes_original
+
+
+            res["lidar"]["annotations"] = gt_dict
+
 
             example.update({'gt_boxes_and_cls': gt_boxes_and_cls})
 

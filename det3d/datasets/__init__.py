@@ -1,8 +1,11 @@
 from .builder import build_dataset
 
 # from .cityscapes import CityscapesDataset
+from .kitti import KittiDataset
 from .nuscenes import NuScenesDataset
 from .waymo import WaymoDataset
+from .providentia import ProvidentiaDataset
+
 
 # from .custom import CustomDataset
 from .dataset_wrappers import ConcatDataset, RepeatDataset

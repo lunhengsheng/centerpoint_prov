@@ -8,8 +8,10 @@ from det3d.datasets.dataset_factory import get_dataset
 from tqdm import tqdm
 
 dataset_name_map = {
+    "KITTI": "KittiDataset",
     "NUSC": "NuScenesDataset",
-    "WAYMO": "WaymoDataset"
+    "WAYMO": "WaymoDataset",
+    "PROV": "ProvidentiaDataset"
 }
 
 
@@ -48,11 +50,17 @@ def create_groundtruth_database(
 
     root_path = Path(data_path)
 
-    if dataset_class_name in ["WAYMO", "NUSC"]: 
+    if dataset_class_name in ["WAYMO", "NUSC", "PROV"]: 
         if db_path is None:
-            db_path = root_path / f"gt_database_{nsweeps}sweeps_withvelo"
+            db_path = root_path / "gt_database_{:02d}sweeps_withvelo".format(nsweeps)
         if dbinfo_path is None:
-            dbinfo_path = root_path / f"dbinfos_train_{nsweeps}sweeps_withvelo.pkl"
+            dbinfo_path = root_path / "dbinfos_train_{:02d}sweeps_withvelo.pkl".format(nsweeps)
+
+    elif dataset_class_name in ["KITTI"]:
+        if db_path is None:
+            db_path = root_path / "gt_database"
+        if dbinfo_path is None:
+            dbinfo_path = root_path / "dbinfos_train.pkl"
     else:
         raise NotImplementedError()
 
@@ -60,8 +68,14 @@ def create_groundtruth_database(
         point_features = 5
     elif dataset_class_name == "WAYMO":
         point_features = 5 if nsweeps == 1 else 6 
+    elif dataset_class_name == "PROV":
+        point_features = 5
+    elif dataset_class_name == "KITTI":
+        point_features = 4
     else:
         raise NotImplementedError()
+
+    print("point_features", point_features)
 
     db_path.mkdir(parents=True, exist_ok=True)
 
@@ -79,6 +93,8 @@ def create_groundtruth_database(
             points = sensor_data["lidar"]["combined"]
         else:
             points = sensor_data["lidar"]["points"]
+
+        print("points = sensor_data[\"lidar\"][\"points\"]", points.shape)
             
         annos = sensor_data["lidar"]["annotations"]
         gt_boxes = annos["boxes"]
@@ -128,6 +144,7 @@ def create_groundtruth_database(
                 with open(filepath, "w") as f:
                     try:
                         gt_points[:, :point_features].tofile(f)
+                        print("gt_points shape", gt_points.shape)
                     except:
                         print("process {} files".format(index))
                         break

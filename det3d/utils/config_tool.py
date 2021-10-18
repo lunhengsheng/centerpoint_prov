@@ -38,13 +38,23 @@ def change_detection_range(model_config, new_range):
 
 def get_downsample_factor(model_config):
     try:
+        model_config.get("neck")
         neck_cfg = model_config["neck"]
+        if model_config.get("encoder2d", None) is not None:
+            neck_cfg = model_config["encoder2d"]
     except:
         model_config = model_config['first_stage_cfg']
         neck_cfg = model_config['neck']
     downsample_factor = np.prod(neck_cfg.get("ds_layer_strides", [1]))
+
+    
     if len(neck_cfg.get("us_layer_strides", [])) > 0:
         downsample_factor /= neck_cfg.get("us_layer_strides", [])[-1]
+
+    
+
+    elif len(model_config['decoder2d'].get("us_layer_strides", [])) > 0:
+        downsample_factor /= model_config['decoder2d'].get("us_layer_strides", [])[-1]   
 
     backbone_cfg = model_config['backbone']
     downsample_factor *= backbone_cfg["ds_factor"]

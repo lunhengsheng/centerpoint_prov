@@ -9,7 +9,11 @@ from .registry import (
     NECKS,
     READERS,
     SECOND_STAGE,
-    ROI_HEAD
+    ROI_HEAD,
+    ENCODERS,
+    DECODERS,
+    CFE,
+    FUSION,
 )
 
 
@@ -34,6 +38,14 @@ def build_reader(cfg):
 def build_backbone(cfg):
     return build(cfg, BACKBONES)
 
+def build_encoder(cfg):
+    return build(cfg, ENCODERS)
+
+def build_cfe(cfg):
+    return build(cfg, CFE)
+
+def build_decoder(cfg):
+    return build(cfg, DECODERS)
 
 def build_neck(cfg):
     return build(cfg, NECKS)
@@ -48,3 +60,6 @@ def build_loss(cfg):
 
 def build_detector(cfg, train_cfg=None, test_cfg=None):
     return build(cfg, DETECTORS, dict(train_cfg=train_cfg, test_cfg=test_cfg))
+
+def build_fusion(cfg):
+    return build(cfg, FUSION)
